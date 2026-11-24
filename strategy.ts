@@ -41,7 +41,7 @@
 // Deterministic by construction: no clock, no randomness, iteration only over
 // insertion-ordered maps fed by the batch stream.
 
-import type { Batch, Bot, BotState, OrderInput, Pubkey } from './vendor/agentfun-bot.ts';
+import type { Batch, Bot, BotState, Mark, OrderInput, Pubkey } from './vendor/agentfun-bot.ts';
 
 export interface Settings {
   /** Entry window in slots. */
@@ -189,6 +189,9 @@ export function makeBot(s: Settings = DEFAULT_SETTINGS): Bot {
   let peakEquity = 0;
   let halted = false;
   const keep = Math.max(s.entryWindow, s.fadeWindow) + 5;
+  /** Reused per-batch scratch, cleared at the top of every onBatch. */
+  const traded = new Set<Pubkey>();
+  const bigSell = new Set<Pubkey>();
 
   const tapeOf = (mint: Pubkey): CoinTape => {
     let t = tapes.get(mint);
@@ -210,7 +213,11 @@ export function makeBot(s: Settings = DEFAULT_SETTINGS): Bot {
     return net;
   };
 
-  /** Entry signal on a curve's tape at slot `now`. */
+  /** Entry signal on a curve's tape at slot `now`. Two-phase: the first pass
+   * computes buys/net/high/up with no byUser Map allocation; only when the
+   * cheap gates pass does a second pass build the buyer-diversity map and
+   * check the top-share gate. All gates are pure ANDs, so the result is
+   * identical to the single-pass version. */
   const entrySignal = (t: CoinTape, now: number, realSol: number): boolean => {
     if (realSol < s.minRealSol || realSol > s.maxRealSol) return false;
     if (t.created === null || now - t.created < s.minAge) return false;
@@ -224,7 +231,6 @@ export function makeBot(s: Settings = DEFAULT_SETTINGS): Bot {
     let startPrice = -1;
     let high = 0;
     let last = 0;
-    const byUser = new Map<string, number>();
     for (const tr of t.trades) {
       if (tr.slot <= from) {
         startPrice = tr.price;
@@ -237,37 +243,52 @@ export function makeBot(s: Settings = DEFAULT_SETTINGS): Bot {
       if (tr.buy) {
         buySol += tr.sol;
         buys++;
-        byUser.set(tr.user, (byUser.get(tr.user) ?? 0) + tr.sol);
       } else {
         sellSol += tr.sol;
       }
       if (tr.price > high) high = tr.price;
       last = tr.price;
     }
-    if (buys < s.minBuys || byUser.size < s.minBuyers) return false;
+    if (buys < s.minBuys) return false;
     if (buySol - sellSol < s.minNetSol) return false;
     if (startPrice <= 0) return false;
     const up = last / startPrice - 1;
     if (up < s.minUp || up > s.maxUp) return false;
     if (last < high * s.nearHigh) return false;
     if (netNew <= 0 || netNew < s.accel * netOld) return false;
+    const byUser = new Map<string, number>();
+    for (const tr of t.trades) {
+      if (tr.slot <= from) continue;
+      if (tr.buy) byUser.set(tr.user, (byUser.get(tr.user) ?? 0) + tr.sol);
+    }
+    if (byUser.size < s.minBuyers) return false;
     let top = 0;
     for (const v of byUser.values()) if (v > top) top = v;
     if (top > s.maxBuyerShare * buySol) return false;
     return true;
   };
 
-  /** Mark-to-market value of a position in SOL, net of the curve fee and one tx fee. */
+  /** Mark-to-market value of a position in SOL, net of the curve fee and one tx fee.
+   * `marks` is the batch's small marks array, scanned from the end (last entry
+   * wins, as a Map built from it would); only held mints are ever looked up.
+   * `tokens` is a bigint under the kit shim and the original decimal string
+   * under the lean wire loop — Number(...) is identical either way. */
   const markValue = (
     state: BotState,
     mint: Pubkey,
-    tokens: bigint,
-    marks: Map<Pubkey, { virtual_quote_reserves: bigint; virtual_token_reserves: bigint }>,
+    tokens: bigint | string,
+    marks: readonly Mark[],
     tx: number,
   ): number => {
     const curve = state.curves.get(mint);
     if (curve === undefined) return 0;
-    const mk = marks.get(mint);
+    let mk: Mark | undefined;
+    for (let i = marks.length - 1; i >= 0; i--) {
+      if (marks[i]!.mint === mint) {
+        mk = marks[i]!;
+        break;
+      }
+    }
     const vq = mk ? Number(mk.virtual_quote_reserves) : Number(curve.virtual_quote_reserves);
     const vt = mk ? Number(mk.virtual_token_reserves) : Number(curve.virtual_token_reserves);
     return ((Number(tokens) * vq) / (vt + Number(tokens)) / LAMPORTS) * (1 - CURVE_FEE) - tx;
@@ -276,8 +297,8 @@ export function makeBot(s: Settings = DEFAULT_SETTINGS): Bot {
   return {
     onBatch(state: BotState, batch: Batch): OrderInput[] {
       const now = batch.slot;
-      const bigSell = new Set<Pubkey>();
-      const traded = new Set<Pubkey>();
+      traded.clear();
+      bigSell.clear();
       for (const f of batch.fills) {
         if (f.status === 'filled' && !f.client_id.startsWith('_')) {
           myFills++;
@@ -311,19 +332,27 @@ export function makeBot(s: Settings = DEFAULT_SETTINGS): Bot {
         while (cut < t.trades.length && t.trades[cut]!.slot <= now - keep) cut++;
         if (cut > 0) t.trades.splice(0, cut);
       }
-      const marks = new Map(batch.marks.map((m) => [m.mint, m] as const));
-      const pendingByMint = new Map<Pubkey, number>();
+      // Marks are only needed for the <= 5 held mints: scan the small marks
+      // array in markValue instead of building a Map per batch.
+      const marks = batch.marks;
+      /** Mints with a pending order -> whether any pending order on it is a sell. */
+      const pendingByMint = new Map<Pubkey, boolean>();
       for (const po of state.pending.values()) {
-        pendingByMint.set(po.order.mint, (pendingByMint.get(po.order.mint) ?? 0) + 1);
+        if (po.order.side === 'sell') pendingByMint.set(po.order.mint, true);
+        else if (!pendingByMint.has(po.order.mint)) pendingByMint.set(po.order.mint, false);
       }
 
       const orders: OrderInput[] = [];
       const cap = state.hello.caps.max_orders_per_batch;
+      // Cached once per batch: pending/positions do not change while onBatch
+      // runs, so the fee, free cash and committed count are constant here.
       const tx = Number(state.txFeeLamports()) / LAMPORTS;
+      const freeCash = Number(state.freeCashLamports()) / LAMPORTS;
+      const committed = state.committedPositionCount();
 
       // Mark-to-market equity for the drawdown guard: free cash (cash minus
       // pending orders) plus marked position values.
-      let equity = Number(state.freeCashLamports()) / LAMPORTS;
+      let equity = freeCash;
       for (const [mint, pos] of state.positions) {
         const curve = state.curves.get(mint);
         if (curve === undefined || curve.complete) continue;
@@ -364,13 +393,7 @@ export function makeBot(s: Settings = DEFAULT_SETTINGS): Bot {
         if (!exit && now - h.opened > s.maxHold && value < cost * 1.05) exit = true;
         if (!exit) continue;
         h.exiting = true;
-        if (pendingByMint.has(mint)) {
-          let sellPending = false;
-          for (const po of state.pending.values()) {
-            if (po.order.mint === mint && po.order.side === 'sell') sellPending = true;
-          }
-          if (sellPending) continue;
-        }
+        if (pendingByMint.get(mint)) continue;
         if (orders.length >= cap) break;
         orders.push({ side: 'sell', mint, token_amount: pos.token_amount, max_slippage_bps: 10_000 });
       }
@@ -390,8 +413,8 @@ export function makeBot(s: Settings = DEFAULT_SETTINGS): Bot {
       }
 
       // Then entries and pyramid adds — never while the drawdown guard is halted.
-      let free = Number(state.freeCashLamports()) / LAMPORTS;
-      let slotsLeft = state.hello.caps.max_open_positions - state.committedPositionCount();
+      let free = freeCash;
+      let slotsLeft = state.hello.caps.max_open_positions - committed;
       let mainLeft = s.maxMain - live.size;
       let exposure = 0;
       for (const [mint, h] of live) {
