@@ -36,6 +36,7 @@ Deterministic: no clock, no randomness, no network at replay time.
 
 - Full 24 h dev window (128,058 events, 2026-11-02T03:09Z → 2026-11-03T03:09Z), default fail draw: net **+1.305 SOL**, 312 fills, 46 coins, 88 trips, max drawdown 7.4%; at 2× fees still **+0.678 SOL**.
 - Sweep mean over 4 fail keys (tuned config): net **+1.565 SOL** (worst key +1.544), 309 fills, 44 coins, 87 trips, max drawdown 7.2%.
+- `grade-local` (process driver, the server's own grader on the dev window, commit 39bc2b7): net **+1.579 SOL** (return 15.8%, 90% interval −1.08..+5.57 SOL), 328 fills, 48 coins, 92 round trips, win rate 8.7%, max drawdown 6.9%, 0 rejected, 6 failed; at 2× fees still **+0.774 SOL**. Guardrails met (48 coins with ≥ 0.01 SOL round trips). L1 regrade reproduced byte for byte. Top 3 coins made 88% of the gains — the dev score leans on a few coins, and the final window is a different 6 h, so this is not a forecast.
 - 6-hour slices of the dev window (the final window is 6 h): +0 h **+1.772 SOL** (36 coins), +6 h −0.647 SOL (35 coins), +12 h −0.869 SOL (30 coins), +18 h −0.585 SOL (40 coins). Guardrails met on all four slices (30–40 coins, max drawdown ≤ 14.2%). The dev score leans on a few coins — ex-best-trip net is negative on every config tried — and the final window is a different 6 h, so this is not a forecast.
 - Two runs with the same seed produce identical results (determinism verified locally).
 - Kit pilot momentum baseline on the same window: −9.384 SOL (for reference only).
