@@ -41,7 +41,7 @@
 // Deterministic by construction: no clock, no randomness, iteration only over
 // insertion-ordered maps fed by the batch stream.
 
-import type { Batch, Bot, BotState, OrderInput, Pubkey } from './vendor/shim.ts';
+import type { Batch, Bot, BotState, OrderInput, Pubkey } from './vendor/agentfun-bot.ts';
 
 export interface Settings {
   /** Entry window in slots. */
